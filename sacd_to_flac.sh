@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # --- Check for Dependencies ---
-# Added 'metaflac' to ensure ReplayGain works
 for cmd in sacd_extract ffmpeg parallel metaflac; do
     if ! command -v "$cmd" &> /dev/null; then
         echo "Error: $cmd is not installed."
@@ -18,16 +17,14 @@ fi
 INPUT_FILE="$1"
 
 # --- Configuration ---
-# Set your desired output sample rate here (e.g., 44100, 88200, 96000, 176400)
+# 44100 or 88200 are recommended for DSD to maintain integer frequency families.
 export SAMPLE_RATE=44100
-
-# Automatically calculate the Nyquist frequency for the lowpass filter
-export LOWPASS=$((SAMPLE_RATE / 2))
 
 # Export the output directory so subshells (parallel) can read it natively
 export OUTPUT_DIR="$(pwd)/Converted_FLAC"
 
 echo "--- Starting SACD Extraction ---"
+# Extracting as DSF (Stereo only)
 sacd_extract -i "$INPUT_FILE" -s -2
 
 if [ $? -ne 0 ]; then
@@ -44,40 +41,36 @@ if [ "$FILE_COUNT" -eq 0 ]; then
     exit 1
 fi
 
-echo "Found $FILE_COUNT files. Converting at ${SAMPLE_RATE}Hz (Lowpass: ${LOWPASS}Hz)..."
+echo "Found $FILE_COUNT files. Converting to ${SAMPLE_RATE}Hz using SoX High-Precision Resampler..."
 
 # --- The Conversion Function ---
 do_convert() {
     local input_file="$1"
-
-    # Extract base filename safely
     local base_name=$(basename "${input_file%.dsf}")
-
-    # Read OUTPUT_DIR directly from the environment
     local output_file="$OUTPUT_DIR/$base_name.flac"
 
     echo "Processing: $base_name"
 
-    # Execute FFmpeg with all variables strictly quoted
-    # Note: Volume gain is intentionally omitted here to prevent clipping
+    # IMPROVEMENTS MADE HERE:
+    # 1. Switched to 'soxr' resampler for superior math.
+    # 2. 'precision=28' ensures 28-bit internal precision (virtually zero rounding error).
+    # 3. 'cheby=1' enables a steep Chebyshev low-pass filter to wipe out DSD noise.
+    # 4. Removed manual 'lowpass' filter as SoX handles it more accurately during resampling.
     ffmpeg -hide_banner -loglevel error -n -i "$input_file" \
-    -af "lowpass=${LOWPASS}, aresample=${SAMPLE_RATE}:dither_method=triangular" \
+    -af "aresample=resampler=soxr:osr=${SAMPLE_RATE}:dither_method=triangular:precision=28:cheby=1" \
     -c:a flac -sample_fmt s32 -bits_per_raw_sample 24 \
     -metadata disc="" -metadata DISCNUMBER="" "$output_file"
 }
 
-# Export the function itself
 export -f do_convert
 
 # --- Execute Parallel ---
-# Convert all DSF files to unclipped FLAC
 find . -name "*.dsf" -print0 | parallel -0 do_convert {}
 
 echo "--- Analyzing Audio and Applying ReplayGain ---"
-# This analyzes all files together to write both TRACK and ALBUM gain tags
 metaflac --add-replay-gain "$OUTPUT_DIR"/*.flac
 
 echo "-------------------------------------------------------"
 echo "Process Finished!"
-echo "Your unclipped, ReplayGain-tagged 24-bit FLAC files are in: $OUTPUT_DIR"
+echo "Your high-fidelity 24-bit FLAC files are in: $OUTPUT_DIR"
 echo "-------------------------------------------------------"
