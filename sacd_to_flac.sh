@@ -57,8 +57,8 @@ do_convert() {
     # 3. 'cheby=1' enables a steep Chebyshev low-pass filter to wipe out DSD noise.
     # 4. Removed manual 'lowpass' filter as SoX handles it more accurately during resampling.
     ffmpeg -hide_banner -loglevel error -n -i "$input_file" \
-    -af "aresample=resampler=soxr:osr=${SAMPLE_RATE}:dither_method=triangular:precision=28:cheby=1" \
-    -c:a flac -sample_fmt s32 -bits_per_raw_sample 24 \
+    -af "aresample=resampler=soxr:osr=${SAMPLE_RATE}:dither_method=triangular:precision=33:cheby=1" \
+    -c:a flac -compression_level 12 -sample_fmt s32 -bits_per_raw_sample 24 \
     -metadata disc="" -metadata DISCNUMBER="" "$output_file"
 }
 
