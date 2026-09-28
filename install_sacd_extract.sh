@@ -19,9 +19,10 @@ echo "--- 3. Configuring the build environment ---"
 mkdir build
 cd build
 
-# Apply specific C flags to ensure compatibility with modern GCC 15 compilers
-# This downgrades the pointer strictness from fatal errors back to warnings
-cmake -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types -Wno-error=int-conversion" ..
+# - CMAKE_POLICY_VERSION_MINIMUM=3.5: Prevents CMake 4.x from failing on legacy <3.5 policies
+# - CMAKE_C_FLAGS: Downgrades strict pointer checks back to warnings on modern GCC
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types -Wno-error=int-conversion" ..
 
 echo "--- 4. Compiling with $(nproc) threads ---"
 make -j$(nproc)
