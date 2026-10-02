@@ -55,6 +55,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 
 # --- Setup Staging Directory & Cleanup Traps ---
 TEMP_DSF_DIR="$(mktemp -d -p "$INPUT_DIR" .tmp_dsf_XXXXXX)"
+export TEMP_DSF_DIR
 
 cleanup() {
     if [[ -d "$TEMP_DSF_DIR" ]]; then
@@ -95,7 +96,12 @@ is_valid_tag() {
 }
 
 FIRST_DSF="$(find "$TEMP_DSF_DIR" -type f -name "*.dsf" | head -n 1)"
-TAG_ARTIST="$(get_tag "artist" "$FIRST_DSF")"
+
+# Check album_artist first for compilation/various artist support, fallback to artist
+TAG_ARTIST="$(get_tag "album_artist" "$FIRST_DSF")"
+if ! is_valid_tag "$TAG_ARTIST"; then
+    TAG_ARTIST="$(get_tag "artist" "$FIRST_DSF")"
+fi
 TAG_ALBUM="$(get_tag "album" "$FIRST_DSF")"
 
 # Replace slashes to prevent creating unintentional nested directories
@@ -127,12 +133,23 @@ do_convert() {
     local base_name
     base_name="$(basename "${input_file%.dsf}")"
     local output_file="$OUTPUT_DIR/$base_name.flac"
+    local temp_flac="${input_file%.dsf}.tmp.flac"
 
+    # Step 3a: Transcode DSD audio to intermediate PCM FLAC via SoX
     ffmpeg -threads "$FFMPEG_THREADS" -hide_banner -loglevel error -i "$input_file" \
         -f sox - | \
-        sox -t sox - -b 24 "$output_file" \
+        sox -t sox - -b 24 "$temp_flac" \
         rate -v -L "$SAMPLE_RATE" \
         dither
+
+    # Step 3b: Remux audio stream and copy all metadata from the original DSF
+    ffmpeg -y -threads "$FFMPEG_THREADS" -hide_banner -loglevel error \
+        -i "$temp_flac" -i "$input_file" \
+        -map 0:a -map_metadata 1 \
+        -c copy "$output_file"
+
+    # Step 3c: Remove intermediate FLAC
+    rm -f "$temp_flac"
 }
 export -f do_convert
 
