@@ -3,13 +3,13 @@
 set -eo pipefail
 
 # ==============================================================================
-# CUE + FLAC Album Splitter & Transcoder
-# Splits single-file CUE/FLAC images into individual tracks, embeds full metadata
-# (Vorbis comments), applies maximum FLAC compression, and tags ReplayGain.
+# CUE + FLAC Album Splitter (Pure FFmpeg)
+# Slices CUE/FLAC images sample-accurately, embeds full Vorbis comment metadata,
+# encodes with maximum FLAC compression (Level 12), and tags album ReplayGain.
 # ==============================================================================
 
 # --- Dependency Check ---
-DEPENDENCIES=(ffmpeg metaflac awk parallel)
+DEPENDENCIES=(ffmpeg ffprobe metaflac awk parallel iconv file)
 for cmd in "${DEPENDENCIES[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: Required dependency '$cmd' is not installed or not in PATH." >&2
@@ -52,9 +52,18 @@ export COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-12}"
 export JOBS="${JOBS:-6}"
 export FFMPEG_THREADS="${FFMPEG_THREADS:-2}"
 
-# --- 1. Parse CUE Sheet via AWK ---
-# Extracts global tags, file references, track numbers, titles, and exact timestamps
-PARSED_MANIFEST="$(awk '
+# --- 1. Normalize Encoding & Strip CRLF / BOM ---
+normalize_cue() {
+    local file="$1"
+    if file -b "$file" | grep -qi "utf-16"; then
+        iconv -f UTF-16 -t UTF-8 "$file" 2>/dev/null || cat "$file"
+    else
+        cat "$file"
+    fi | tr -d '\r' | sed '1s/^\xEF\xBB\xBF//'
+}
+
+# --- 2. CUE Sheet Parsing via AWK ---
+PARSED_MANIFEST="$(normalize_cue "$CUE_FILE" | awk '
 BEGIN {
     track_count = 0
     current_track = 0
@@ -66,57 +75,80 @@ BEGIN {
     audio_file = ""
 }
 {
-    sub(/\r$/, "")              # Strip Windows CRLF line endings
-    sub(/^[ \t]+/, "")          # Strip leading whitespace
-    sub(/[ \t]+$/, "")          # Strip trailing whitespace
+    sub(/\r$/, "")
+    sub(/^[ \t]+/, "")
+    sub(/[ \t]+$/, "")
+    u = toupper($0)
 }
-/^REM[ \t]+GENRE[ \t]+/i {
-    val = $0; sub(/^REM[ \t]+GENRE[ \t]+/i, "", val); gsub(/^"|"$/, "", val)
-    if (genre == "") genre = val; next
-}
-/^REM[ \t]+(DATE|YEAR)[ \t]+/i {
-    val = $0; sub(/^REM[ \t]+(DATE|YEAR)[ \t]+/i, "", val); gsub(/^"|"$/, "", val)
-    if (date == "") date = val; next
-}
-/^REM[ \t]+DISCNUMBER[ \t]+/i {
-    val = $0; sub(/^REM[ \t]+DISCNUMBER[ \t]+/i, "", val); gsub(/^"|"$/, "", val)
-    if (disc == "") disc = val; next
-}
-/^PERFORMER[ \t]+/i {
-    val = $0; sub(/^PERFORMER[ \t]+/i, "", val); gsub(/^"|"$/, "", val)
-    if (current_track == 0) album_artist = val
-    else track_artist[current_track] = val
+u ~ /^REM[ \t]+GENRE[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", val)
+    gsub(/^"|"$/, "", val)
+    if (genre == "") genre = val
     next
 }
-/^TITLE[ \t]+/i {
-    val = $0; sub(/^TITLE[ \t]+/i, "", val); gsub(/^"|"$/, "", val)
-    if (current_track == 0) album_title = val
-    else track_title[current_track] = val
+u ~ /^REM[ \t]+(DATE|YEAR)[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", val)
+    gsub(/^"|"$/, "", val)
+    if (date == "") date = val
     next
 }
-/^FILE[ \t]+/i {
-    val = $0; sub(/^FILE[ \t]+/, "", val)
-    sub(/[ \t]+(WAVE|FLAC|MP3|BINARY|MOTOROLA)[ \t]*$/i, "", val)
+u ~ /^REM[ \t]+DISCNUMBER[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", val)
+    gsub(/^"|"$/, "", val)
+    if (disc == "") disc = val
+    next
+}
+u ~ /^PERFORMER[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+/, "", val)
+    gsub(/^"|"$/, "", val)
+    if (current_track == 0) {
+        if (album_artist == "") album_artist = val
+    } else {
+        track_artist[current_track] = val
+    }
+    next
+}
+u ~ /^TITLE[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+/, "", val)
+    gsub(/^"|"$/, "", val)
+    if (current_track == 0) {
+        if (album_title == "") album_title = val
+    } else {
+        track_title[current_track] = val
+    }
+    next
+}
+u ~ /^FILE[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+/, "", val)
+    sub(/[ \t]+[^ \t]+$/, "", val)
     gsub(/^"|"$/, "", val)
     if (audio_file == "") audio_file = val
     next
 }
-/^TRACK[ \t]+[0-9]+[ \t]+/i {
+u ~ /^TRACK[ \t]+[0-9]+/ {
     current_track++
     match($0, /[0-9]+/)
     track_num[current_track] = substr($0, RSTART, RLENGTH)
     track_count = current_track
     next
 }
-/^INDEX[ \t]+00[ \t]+/i {
-    val = $0; sub(/^INDEX[ \t]+00[ \t]+/, "", val)
+u ~ /^INDEX[ \t]+00[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", val)
     split(val, ts, ":")
     sec = (ts[1] * 60) + ts[2] + (ts[3] / 75.0)
     track_idx00[current_track] = sec
     next
 }
-/^INDEX[ \t]+01[ \t]+/i {
-    val = $0; sub(/^INDEX[ \t]+01[ \t]+/, "", val)
+u ~ /^INDEX[ \t]+01[ \t]+/ {
+    val = $0
+    sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", val)
     split(val, ts, ":")
     sec = (ts[1] * 60) + ts[2] + (ts[3] / 75.0)
     track_idx01[current_track] = sec
@@ -132,7 +164,6 @@ END {
     print "META:TRACKTOTAL=" track_count
 
     for (i = 1; i <= track_count; i++) {
-        # Track 1 starts at 0 or its pregap; subsequent tracks start at INDEX 01
         if (i == 1 && (1 in track_idx00) && track_idx00[1] < track_idx01[1]) {
             start_t = track_idx00[1]
         } else if (i in track_idx01) {
@@ -141,7 +172,6 @@ END {
             start_t = 0
         }
 
-        # Track end is the exact start of the next track
         if (i < track_count) {
             end_t = (i+1 in track_idx01) ? track_idx01[i+1] : ""
         } else {
@@ -157,11 +187,11 @@ END {
 
         printf "TRACK\t%s\t%s\t%s\t%.6f\t%s\n", num, tit, art, start_t, (end_t != "" ? sprintf("%.6f", end_t) : "")
     }
-}' "$CUE_FILE")"
+}')"
 
-# --- 2. Extract Metadata Variables ---
+# --- 3. Extract & Sanitize Metadata ---
 get_meta() {
-    grep "^META:$1=" <<< "$PARSED_MANIFEST" | head -n 1 | cut -d'=' -f2-
+    grep "^META:$1=" <<< "$PARSED_MANIFEST" | head -n 1 | cut -d'=' -f2- | tr -d '\r\n'
 }
 
 export ALBUM_TITLE="$(get_meta "ALBUM")"
@@ -172,12 +202,17 @@ export DISCNUMBER="$(get_meta "DISCNUMBER")"
 export TRACKTOTAL="$(get_meta "TRACKTOTAL")"
 CUE_AUDIO_FILE="$(get_meta "FILE")"
 
-# --- 3. Resolve Target Audio File ---
+if [[ -z "$TRACKTOTAL" ]] || [[ "$TRACKTOTAL" -eq 0 ]]; then
+    echo "Error: Failed to parse any tracks from CUE sheet: $CUE_FILE" >&2
+    exit 1
+fi
+
+# --- 4. Resolve Target Audio File ---
 if [[ $# -ge 2 ]]; then
     FLAC_FILE="$(realpath "$2")"
-elif [[ -n "$CUE_AUDIO_FILE" && -f "$CUE_DIR/$CUE_AUDIO_FILE" ]]; then
+elif [[ -n "$CUE_AUDIO_FILE" ]] && [[ -f "$CUE_DIR/$CUE_AUDIO_FILE" ]]; then
     FLAC_FILE="$CUE_DIR/$CUE_AUDIO_FILE"
-elif [[ -n "$CUE_AUDIO_FILE" && -f "$CUE_DIR/${CUE_AUDIO_FILE%.*}.flac" ]]; then
+elif [[ -n "$CUE_AUDIO_FILE" ]] && [[ -f "$CUE_DIR/${CUE_AUDIO_FILE%.*}.flac" ]]; then
     FLAC_FILE="$CUE_DIR/${CUE_AUDIO_FILE%.*}.flac"
 elif [[ -f "${CUE_FILE%.cue}.flac" ]]; then
     FLAC_FILE="${CUE_FILE%.cue}.flac"
@@ -200,19 +235,23 @@ if [[ ! -f "$FLAC_FILE" ]]; then
 fi
 export FLAC_FILE
 
-# --- 4. Resolve Output Directory ---
+# --- 5. Resolve Output Directory (NTFS/FAT Safe) ---
 clean_name() {
     local str="$1"
-    str="${str//\//-}"
-    str="${str//:/-}"
-    str="${str//\\/-}"
-    echo "$str"
+    # Remove CR, LF, and control characters
+    str="$(printf '%s' "$str" | tr -d '\r\n' | tr -cd '[:print:]')"
+    # Replace illegal filesystem characters: / \ : * ? " < > |
+    str="${str//[\/\\:\*\?\"<>|]/-}"
+    # Strip leading/trailing spaces and trailing dots (forbidden on NTFS/exFAT)
+    str="$(printf '%s' "$str" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:].]*$//')"
+    printf '%s' "$str"
 }
+export -f clean_name
 
 SAFE_ARTIST="$(clean_name "${ALBUM_ARTIST:-Unknown Artist}")"
 SAFE_ALBUM="$(clean_name "${ALBUM_TITLE:-Unknown Album}")"
 
-if [[ -n "$ALBUM_ARTIST" && -n "$ALBUM_TITLE" ]]; then
+if [[ -n "$ALBUM_ARTIST" ]] && [[ -n "$ALBUM_TITLE" ]]; then
     DEST_SUBDIR="${SAFE_ARTIST} - ${SAFE_ALBUM}"
 elif [[ -n "$ALBUM_TITLE" ]]; then
     DEST_SUBDIR="${SAFE_ALBUM}"
@@ -221,34 +260,31 @@ else
 fi
 
 export OUTPUT_DIR="$CUE_DIR/$DEST_SUBDIR"
-mkdir -p "$OUTPUT_DIR"
+mkdir -p -- "$OUTPUT_DIR"
 
 echo "Source CUE:   $(basename "$CUE_FILE")"
 echo "Source Audio: $(basename "$FLAC_FILE")"
 echo "Destination:  $DEST_SUBDIR"
-echo "Splitting $TRACKTOTAL tracks (FLAC Level $COMPRESSION_LEVEL)..."
+echo "Splitting $TRACKTOTAL tracks with FFmpeg (Compression Level $COMPRESSION_LEVEL)..."
 
-# --- 5. Splitting Engine ---
+# --- 6. FFmpeg Splitting Engine ---
 split_track() {
-    local num="$1"
-    local title="$2"
-    local artist="$3"
-    local start_sec="$4"
-    local end_sec="$5"
+    set -eo pipefail
+
+    local num="$(printf '%s' "$1" | tr -d '\r\n')"
+    local title="$(printf '%s' "$2" | tr -d '\r\n')"
+    local artist="$(printf '%s' "$3" | tr -d '\r\n')"
+    local start_sec="$(printf '%s' "$4" | tr -d '\r\n')"
+    local end_sec="$(printf '%s' "$5" | tr -d '\r\n')"
 
     local pad_num
     printf -v pad_num "%02d" "$((10#$num))"
 
-    local safe_title="$title"
-    safe_title="${safe_title//\//-}"
-    safe_title="${safe_title//:/-}"
-    safe_title="${safe_title//\\/-}"
-    safe_title="${safe_title//\"/}"
-    safe_title="${safe_title//\?/}"
+    local safe_title
+    safe_title="$(clean_name "$title")"
 
     local output_file="$OUTPUT_DIR/${pad_num} - ${safe_title}.flac"
 
-    # Calculate duration if end time is present
     local time_args=()
     if [[ -n "$end_sec" ]]; then
         local duration
@@ -258,7 +294,6 @@ split_track() {
         time_args=(-ss "$start_sec")
     fi
 
-    # Decode interval with sample accuracy and encode with maximum compression
     ffmpeg -y -threads "$FFMPEG_THREADS" -hide_banner -loglevel error \
         "${time_args[@]}" -i "$FLAC_FILE" \
         -c:a flac -compression_level "$COMPRESSION_LEVEL" \
@@ -274,11 +309,11 @@ split_track() {
 }
 export -f split_track
 
-# --- 6. Parallel Execution ---
+# --- 7. Parallel Execution ---
 grep '^TRACK'$'\t' <<< "$PARSED_MANIFEST" | cut -f2- | \
     parallel --colsep '\t' -j "$JOBS" --bar split_track {1} {2} {3} {4} {5}
 
-# --- 7. ReplayGain Embedding ---
+# --- 8. ReplayGain Embedding ---
 echo "--- Calculating and Embedding ReplayGain ---"
 shopt -s nullglob
 SPLIT_FLACS=("$OUTPUT_DIR"/*.flac)
